@@ -399,6 +399,10 @@ def _apply_hard_kill(scenario: dict, contact_id: str, t: float) -> dict:
     UAV_FAILURE at that instant, and lets ares's actual recovery/relay logic
     react from there. Returns {"reactive": bool, "contacts": [...]}.
     """
+    scenario.setdefault("destroyed_contact_ids", [])
+    if contact_id not in scenario["destroyed_contact_ids"]:
+        scenario["destroyed_contact_ids"].append(contact_id)
+
     # a split-swarm scenario (red-team tactic 7) has two independent swarm
     # groups, each with its own replay metadata — find whichever one owns
     # this contact.
@@ -409,6 +413,12 @@ def _apply_hard_kill(scenario: dict, contact_id: str, t: float) -> dict:
             meta = candidate
             break
     if meta is None:
+        target_c = next((c for c in scenario["contacts"] if c.get("contact_id") == contact_id or c.get("id") == contact_id), None)
+        if target_c is not None:
+            target_c["state"] = "neutralized"
+            target_c["engagement_action"] = "hard_kill"
+            target_c["engagement_at"] = t
+            target_c["despawn_t"] = min(target_c.get("despawn_t", float("inf")), t)
         return {"reactive": False, "contacts": []}
 
     uav_id = meta["contact_to_uav"][contact_id]
@@ -432,7 +442,13 @@ def _apply_hard_kill(scenario: dict, contact_id: str, t: float) -> dict:
         c["path"] = [{"t": p["t"], "x": p["x"], "y": p["y"], "z": p["z"]} for p in pts]
         failed_at = next((p["t"] for p in pts if p.get("health") == "FAILED"), None)
         c["spawn_t"] = c["path"][0]["t"]
-        c["despawn_t"] = failed_at if failed_at is not None else c["path"][-1]["t"]
+        if cid == contact_id or failed_at is not None:
+            c["despawn_t"] = failed_at if failed_at is not None else min(c.get("despawn_t", float("inf")), t)
+            c["state"] = "neutralized"
+            c["engagement_action"] = "hard_kill"
+            c["engagement_at"] = t
+        else:
+            c["despawn_t"] = c["path"][-1]["t"]
 
     updated_ids = set(meta["uav_to_contact"].values())
     sanitized = sanitize_for_client(scenario)
@@ -463,6 +479,12 @@ def engage_contact(req: EngageRequest):
 
     if req.action not in ("hard_kill", "engage"):
         return {"reactive": False, "contacts": []}
+
+    contact["state"] = "neutralized"
+    contact["engagement_action"] = "hard_kill"
+    contact["engagement_at"] = req.t
+    contact["despawn_t"] = min(contact.get("despawn_t", float("inf")), req.t)
+
     return _apply_hard_kill(scenario, req.contact_id, req.t)
 
 
@@ -549,7 +571,14 @@ def team_action(req: TeamActionRequest):
         raise HTTPException(400, "engagement_authority's actions are warn/monitor/ignore/soft_kill/hard_kill")
     entry["engagement_action"] = req.field
     entry["engagement_at"] = req.t
-    reactive = _apply_hard_kill(scenario, req.contact_id, req.t) if req.field == "hard_kill" else {"reactive": False, "contacts": []}
+    if req.field == "hard_kill":
+        contact["state"] = "neutralized"
+        contact["engagement_action"] = "hard_kill"
+        contact["engagement_at"] = req.t
+        contact["despawn_t"] = min(contact.get("despawn_t", float("inf")), req.t)
+        reactive = _apply_hard_kill(scenario, req.contact_id, req.t)
+    else:
+        reactive = {"reactive": False, "contacts": []}
     return {"ok": True, "entry": entry, **reactive}
 
 
@@ -571,7 +600,7 @@ def team_state(scenario_id: str, role: str, t: float):
 
     visible = []
     for c in sanitized["contacts"]:
-        entry = log.get(c["contact_id"], {})
+        entry = _team_entry(scenario, c["contact_id"])
         if role == "detector":
             visible.append({**c, "team": entry})
         elif role == "classifier":
@@ -612,6 +641,28 @@ def submit_team_session(req: SubmitTeamSessionRequest):
 
     trainee_log = [{"contact_id": cid, **entry} for cid, entry in _team_log(scenario).items()]
     result = score_session(scenario, trainee_log)
+
+    # Populate explicit score fields and operational bottleneck analysis
+    det_s = result.get("detection_score", 0.0)
+    cls_s = result.get("classification_score", 0.0)
+    eng_s = result.get("engagement_score", 0.0)
+    tml_s = result.get("timeliness_score", 0.0)
+
+    lowest = min(det_s, cls_s, eng_s)
+    if lowest == det_s and det_s < 70:
+        bottleneck = f"Detection bottleneck: Operator missed or delayed radar acquisition on {result.get('contacts_missed', 0)} contact(s)."
+    elif lowest == cls_s and cls_s < 70:
+        bottleneck = f"Classification bottleneck: Multispectral signature recognition accuracy was low ({cls_s}%)."
+    elif lowest == eng_s and eng_s < 70:
+        bottleneck = f"Engagement bottleneck: Kinetic/soft-kill assignment delayed or conflicted with ROE."
+    elif tml_s < 70:
+        bottleneck = f"Latency bottleneck: Comms latency (+{scenario.get('team_comms_delay_s', 5.0)}s) degraded engagement timeliness."
+    else:
+        bottleneck = "Synchronized C2 performance: Coordinated detection, classification, and engagement across all stations."
+
+    result["bottleneck"] = bottleneck
+    result["score"] = result["overall_score"]
+    result["team_score"] = result["overall_score"]
 
     aar_arm = seq_arm = None
     if req.participate_in_research:
@@ -655,6 +706,7 @@ def submit_session(req: SubmitSessionRequest):
         raise HTTPException(404, "unknown or expired scenario_id. Please start a new scenario.")
 
     result = score_session(scenario, req.trainee_log)
+    result["score"] = result["overall_score"]
 
     aar_arm = seq_arm = None
     if req.participate_in_research:

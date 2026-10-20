@@ -54,7 +54,9 @@ export function useVrSession(): UseVrSessionReturn {
   const getElapsed = useCallback((): number => {
     const epoch = scenarioRef.current?.server_start_epoch_ms ?? localStartEpochRef.current;
     if (!epoch) return 0;
-    return Math.max(0, (Date.now() - epoch) / 1000);
+    const duration = scenarioRef.current?.duration_s || 300;
+    const raw = Math.max(0, (Date.now() - epoch) / 1000);
+    return raw > duration ? (raw % duration) : raw;
   }, []);
 
   // Update scenarioId with storage mirror and state update
@@ -236,13 +238,22 @@ export function useVrSession(): UseVrSessionReturn {
       if (scenario.contacts && Array.isArray(scenario.contacts)) {
         const enriched = enrichScenarioContacts(scenario.contacts, t, traineeLog);
 
-        // Drop contacts outside spawn_t..despawn_t
+        // Keep all scenario tracks matching Trainer.tsx scopes (do not drop tracks before spawn_t)
+        // Strictly exclude targets marked neutralized, destroyed, or hard-killed
         const visible = enriched.filter((c) => {
-          const raw = scenario.contacts.find((r: any) => (r.contact_id || r.id) === c.id);
-          if (!raw) return true;
-          if (raw.spawn_t !== undefined && t < raw.spawn_t) return false;
-          if (raw.despawn_t !== undefined && t > raw.despawn_t) return false;
-          return true;
+          const entry = traineeLog[c.id];
+          const isNeutralized =
+            c.state === 'neutralized' ||
+            c.state === 'destroyed' ||
+            entry?.state === 'neutralized' ||
+            entry?.state === 'destroyed' ||
+            entry?.engagement_action === 'hard_kill' ||
+            c.engagement_action === 'hard_kill' ||
+            (c as any).engagement_action === 'hard_kill' ||
+            (c.despawn_t !== undefined && c.despawn_t > 0 && t >= c.despawn_t) ||
+            scenario?.destroyed_contact_ids?.includes(c.id);
+
+          return !isNeutralized;
         });
 
         // Overlay classification:
